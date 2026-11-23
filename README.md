@@ -4,7 +4,7 @@
 
 | 镜像 | 上游 | 流水线 | 平台 |
 |---|---|---|---|
-| `ghcr.io/<owner>/agents-anywhere` | [`anywhere-labs/Agents-Anywhere`](https://github.com/anywhere-labs/Agents-Anywhere) 的 GitHub Release | [`agents-anywhere.yml`](.github/workflows/agents-anywhere.yml) | amd64 |
+| `ghcr.io/<owner>/agents-anywhere` | [`anywhere-labs/Agents-Anywhere`](https://github.com/anywhere-labs/Agents-Anywhere) 的 GitHub Release | [`agents-anywhere.yml`](.github/workflows/agents-anywhere.yml) | amd64 + arm64 |
 
 > **本仓库不含任何上游源码。** 源码只在构建时按 release tag 现取，用完即弃。
 > `deploy/` 下是「怎么把镜像跑起来」的说明。
@@ -26,14 +26,23 @@
 | `latest` | 最新一份**正式** release 的构建 |
 | `vX.Y.Z` | 对应上游 release tag |
 | `sha-<前12位>` | 内容寻址，对应 release 指向的提交；也是判断「有没有更新」的依据 |
+| `sha-<前12位>-amd64` / `-arm64` | 按架构的中间产物（合成多架构 manifest 用，调试也能单独拉） |
 
 ```bash
 docker pull ghcr.io/<owner>/agents-anywhere:latest
 ```
 
-平台**仅 `linux/amd64`**：上游构建里有 Next.js（node 阶段 `yarn build` + python 阶段 `uv sync`），
-在 QEMU 下模拟 arm64 会慢到不可用。arm64 机器请用 `--platform linux/amd64` 走模拟，
-或者自己 fork 掉这条流水线的 `platforms`（会很久）。
+平台 `linux/amd64` + `linux/arm64`，**两个架构各自原生构建**，不用 QEMU：
+
+| 架构 | runner | 说明 |
+|---|---|---|
+| amd64 | `ubuntu-latest` | |
+| arm64 | `ubuntu-24.04-arm` | GitHub 的 arm64 托管 runner，换自建机器设 `AGENTS_ANYWHERE_ARM64_RUNNER` |
+
+上游构建里有 Next.js（node 阶段 `yarn build` + python 阶段 `uv sync`），在 QEMU 下模拟 arm64
+会慢到不可用 —— 所以拆成两个 job 并行，各自用原生 CPU。两个 job 分别推
+`<内容寻址>-amd64` / `<内容寻址>-arm64`，最后由 `merge` job 用 `docker buildx imagetools create`
+合成多架构 manifest，`docker pull` 会按机器架构自动选层。
 
 ---
 
@@ -63,14 +72,18 @@ gh workflow run agents-anywhere.yml -f tag=v2.2.0      # 重建指定 release（
    │     → tag_name / published_at / html_url
    │
    ├─ 解析该 tag 指向的提交 → sha
-   ├─ 问 GHCR：<image>:sha-<前12位> 在不在？
-   │     在  → 内容没变，跳过（不构建）
-   │     不在 → 往下走
+   ├─ 问 GHCR：<image>:sha-<前12位>、-amd64、-arm64 三个都在吗？
+   │     都在 → 内容没变，跳过（不构建）
+   │     缺一个 → 往下走
    │
-   ├─ 下 codeload 的 tag 源码 tarball → 解到 src/（构建上下文必须是仓库根）
-   ├─ 校验 Dockerfile 依赖的输入都在（web-next/package.json、.yarnrc.yml、server/pyproject.toml）
-   ├─ 用**上游自带的 docker/Dockerfile**（target=server）构建 linux/amd64
-   └─ 推 GHCR：latest（仅当是最新 release）+ vX.Y.Z + sha-<前12位>
+   ├─ [build ×2，并行]
+   │   ├─ 下 codeload 的 tag 源码 tarball → 解到 src/（构建上下文必须是仓库根）
+   │   ├─ 校验 Dockerfile 依赖的输入都在（web-next/package.json、.yarnrc.yml、server/pyproject.toml）
+   │   ├─ 用**上游自带的 docker/Dockerfile**（target=server）构建 linux/<arch>
+   │   └─ 推 <image>:sha-<前12位>-<arch>
+   │
+   └─ [merge] 两个中间 manifest 都在 → imagetools create 合成
+        latest（仅当是最新 release）+ vX.Y.Z + sha-<前12位>
 ```
 
 判断依据是**release 指向的提交**而不是 release tag 本身：维护者重新发布、把 tag 移动到别的
@@ -96,6 +109,7 @@ gh workflow run agents-anywhere.yml -f tag=v2.2.0      # 重建指定 release（
 | 类型 | 名称 | 必需 | 说明 |
 |---|---|---|---|
 | Variable | `AGENTS_ANYWHERE_IMAGE_NAME` | 否 | 改镜像名，默认 `agents-anywhere` |
+| Variable | `AGENTS_ANYWHERE_ARM64_RUNNER` | 否 | 换 arm64 构建用的 runner，默认 `ubuntu-24.04-arm` |
 
 **改轮询频率**：编辑 `.github/workflows/agents-anywhere.yml` 里的 cron。
 
@@ -109,11 +123,18 @@ gh workflow run agents-anywhere.yml -f tag=v2.2.0      # 重建指定 release（
 ## 常见问题
 
 - **上游没有新 release，但我想重建**：Run workflow 勾 `force`。
+- **刚改成双架构后的第一次运行**：会重建一遍——旧的单架构流水线只推了 `sha-xxx`，
+  没有 `-amd64` / `-arm64` 中间标签，所以判断逻辑会认为是「没建全」。
 - **上游还很新、一个 release 都没有**：这条流水线会 `::error::` 退出（`/releases/latest` 404），
   不会产出半成品镜像。
 - **构建失败在上游**：Dockerfile 或输入路径被上游改动时，工作流会在「下载源码」那步就明确报
   `::error::` 缺哪个文件，而不是闷头跑二十分钟再失败。
 - **`latest` 没动**：只有「最新那份 release」的构建才会推 `latest`；重建历史版本不影响它。
+- **只想重跑一个架构**：`build` job 用了 `fail-fast: false`，两个架构互不牵连；单边失败时
+  下一次 `force` 重建会复用另一边的层缓存。
+- **arm64 runner 不可用**（私有仓库且套餐不支持 arm64 托管 runner）：设 Variable
+  `AGENTS_ANYWHERE_ARM64_RUNNER` 指向自建 arm64 runner，或把 workflow 里那一行删掉，
+  退回单架构（arm 服务器就只能走 QEMU 模拟）。
 - **GitHub 的 `schedule` 不保证准点**，也可能跳过某次 —— 平台行为，下一次照样会检出变化。
 
 ---

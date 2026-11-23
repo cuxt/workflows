@@ -1,7 +1,8 @@
 # 跑起来：Agents-Anywhere 服务端 + Postgres + Redis
 
 镜像由[本仓库 CI](../../.github/workflows/agents-anywhere.yml)构建：
-`ghcr.io/<owner>/agents-anywhere`。这里只管**服务端**；连接器、桌面/手机客户端是另一回事
+`ghcr.io/<owner>/agents-anywhere`。**多架构**（amd64 + arm64），`docker compose` 会按本机架构自动选层，
+arm 服务器不需要开 QEMU 模拟。这里只管**服务端**；连接器、桌面/手机客户端是另一回事
 （客户端去[上游下载页](https://www.agents-anywhere.com/download)，连接器装在被管理的机器上）。
 
 | 组件 | 镜像 | 作用 | 端口 | 持久化 |

@@ -6,11 +6,14 @@
 #
 # 几个关键取舍（改之前先读）：
 #   · 触发依据是**上游 Release 的 tag**，不是分支 HEAD —— 跟着发版走，产物可追溯；
-#   · 只出 linux/amd64：构建里有 Next.js（node 阶段 yarn build + python 阶段 uv sync），
-#     在 QEMU 下模拟 arm64 会慢到不可用；
 #   · 构建上下文是**整个上游仓库**（docker/Dockerfile 要 COPY web-next/ 与 server/），
 #     所以按 tag 下源码 tarball 解到 src/ 再构建；
-#   · 没有 QEMU 步骤（单架构不需要）。
+#   · **amd64 与 arm64 各用原生 runner 构建**，不用 QEMU：
+#       amd64 → ubuntu-latest，arm64 → ubuntu-24.04-arm
+#     理由：构建里的 Next.js（yarn build）在 QEMU 下会慢到不可用，而运行时镜像只有
+#     Python + 静态前端，原生 arm64 层在 arm 服务器上跑起来没有任何翻译损耗。
+#     两个架构并行构建，各自推 `:<内容寻址>-<arch>` 中间标签，最后由 merge job 用
+#     `imagetools create` 合成多架构 manifest，所以 `docker pull` 会自动选对本机架构。
 #
 # 触发：
 #   · schedule           每 6 小时看一次有没有新 release（有新的才构建）
@@ -38,7 +41,7 @@ on:
         required: false
         default: ''
   push:
-    # 只认本文件的变化：之后改 README 不会白白跑一次十几分钟的构建。
+    # 只认本文件的变化：之后改 README 不会白白跑一次构建。
     paths:
       - '.github/workflows/agents-anywhere.yml'
 
@@ -57,12 +60,21 @@ env:
   UPSTREAM_DOCKERFILE: docker/Dockerfile
 
 jobs:
-  build:
+  # ── 1. 解析目标：查 release、判断要不要建、算出最终标签 ───────────────────
+  prepare:
     runs-on: ubuntu-latest
-    # Next.js + uv 的完整构建大约十几到二十分钟；卡住时别一直占着 runner。
-    timeout-minutes: 90
+    timeout-minutes: 10
     # push 触发时只在默认分支上真跑，避免 feature 分支把 latest 覆盖掉。
     if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    outputs:
+      image: ${{ steps.image.outputs.ghcr }}
+      tag: ${{ steps.rel.outputs.tag }}
+      sha: ${{ steps.rel.outputs.sha }}
+      html: ${{ steps.rel.outputs.html }}
+      is_latest: ${{ steps.rel.outputs.is_latest }}
+      probe: ${{ steps.check.outputs.probe_tag }}
+      need_build: ${{ steps.check.outputs.need_build }}
+      tags: ${{ steps.tags.outputs.tags }}
     steps:
       - name: 解析镜像名
         id: image
@@ -161,35 +173,26 @@ jobs:
             echo "need_build=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if docker buildx imagetools inspect "${IMAGE}:${PROBE}" >/dev/null 2>&1; then
-            echo "上游 release 未变化：${IMAGE}:${PROBE} 已存在（对应 ${TAG}），跳过构建"
+
+          # 三个标签都在才算「已构建」：合成后的多架构 manifest，以及两个架构的中间产物。
+          # 少了中间产物说明是旧的单架构流水线打的（或者某个架构上次失败了），要重建。
+          MISSING=0
+          for t in "${IMAGE}:${PROBE}" "${IMAGE}:${PROBE}-amd64" "${IMAGE}:${PROBE}-arm64"; do
+            if docker buildx imagetools inspect "$t" >/dev/null 2>&1; then
+              echo "已存在：$t"
+            else
+              echo "缺失：$t"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" = "0" ]; then
+            echo "上游 release 未变化（${TAG} → ${PROBE} 已完整构建），跳过"
             echo "need_build=0" >> "$GITHUB_OUTPUT"
           else
-            echo "检测到新的 release（${TAG} → ${PROBE} 尚不存在），开始构建"
+            echo "检测到需要构建（${TAG} → ${PROBE}）"
             echo "need_build=1" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: 下载该 release 的源码
-        if: steps.check.outputs.need_build == '1'
-        env:
-          TAG: ${{ steps.rel.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # 按 tag 取源码 tarball（codeload 不需要 token）。构建上下文必须是**仓库根**，
-          # 因为 docker/Dockerfile 里 COPY 的是 web-next/ 与 server/。
-          URL="https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/refs/tags/${TAG}"
-          curl -fsSL --retry 3 --retry-delay 5 -o upstream-src.tgz "$URL"
-
-          mkdir -p src
-          tar -xzf upstream-src.tgz -C src --strip-components=1
-          rm -f upstream-src.tgz
-
-          # 上游改动 Dockerfile 的输入路径时在这里就明确失败，别等到两层构建跑完才报错。
-          for f in "${UPSTREAM_DOCKERFILE}" web-next/package.json web-next/.yarnrc.yml server/pyproject.toml; do
-            [ -f "src/${f}" ] \
-              || { echo "::error::${TAG} 的源码里没有 ${f}，无法构建"; exit 1; }
-          done
-          echo "源码大小：$(du -sh src | cut -f1)"
 
       - name: 解析标签
         if: steps.check.outputs.need_build == '1'
@@ -211,88 +214,8 @@ jobs:
             printf '%s\n' "$TAGS"
             echo "__TAGS__"
           } >> "$GITHUB_OUTPUT"
-          echo "本次将推送："
+          echo "合并且将推送："
           printf '%s\n' "$TAGS" | sed 's/^/  /'
-
-      - name: 设置 Buildx
-        if: steps.check.outputs.need_build == '1'
-        uses: docker/setup-buildx-action@v3
-
-      - name: 构建并推送（linux/amd64）
-        if: steps.check.outputs.need_build == '1'
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: ./src
-          # 上游自带的 Dockerfile：多阶段（node 里 yarn build → python 里 uv sync），
-          # tini 当 PID 1，监听 8000，数据目录 /data。
-          # 显式指定 target：万一上游以后在 server 之后又加阶段，默认 target 会打错产物，
-          # 而这里会直接失败。
-          file: ./src/docker/Dockerfile
-          target: server
-          # 单架构：Next.js 构建在 QEMU 下会慢到不可用，所以这里不做 arm64。
-          platforms: linux/amd64
-          push: true
-          # 每次都重新拉基础镜像：node / python 的 slim 层更新后能自动跟上，不用等下次改代码。
-          pull: true
-          labels: |
-            org.opencontainers.image.title=agents-anywhere
-            org.opencontainers.image.description=Agents-Anywhere 服务端（上游源码构建，非官方镜像）
-            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
-            org.opencontainers.image.url=${{ steps.rel.outputs.html }}
-            org.opencontainers.image.revision=${{ steps.rel.outputs.sha }}
-            org.opencontainers.image.version=${{ steps.rel.outputs.tag }}
-            org.opencontainers.image.licenses=Apache-2.0
-            org.agents-anywhere.upstream.repo=${{ env.UPSTREAM_REPO }}
-            org.agents-anywhere.upstream.release=${{ steps.rel.outputs.tag }}
-            org.agents-anywhere.upstream.commit=${{ steps.rel.outputs.sha }}
-            org.agents-anywhere.built-by=github.com/${{ github.repository }}
-          tags: ${{ steps.tags.outputs.tags }}
-          # 关掉证明：它会在 manifest 里塞进 attestation 条目，个别旧版 Docker 拉取时报
-          # unknown/unknown platform。要溯源就跑 `docker buildx imagetools inspect`。
-          provenance: false
-          sbom: false
-          # 复用上一次的层缓存（yarn / uv 那几层没变就不用重装）。
-          cache-from: type=gha,scope=agents-anywhere
-          cache-to: type=gha,mode=max,scope=agents-anywhere
-
-      - name: 输出结果
-        if: steps.check.outputs.need_build == '1'
-        env:
-          GHCR: ${{ steps.image.outputs.ghcr }}
-          TAG: ${{ steps.rel.outputs.tag }}
-          PROBE: ${{ steps.check.outputs.probe_tag }}
-          IS_LATEST: ${{ steps.rel.outputs.is_latest }}
-          HTML: ${{ steps.rel.outputs.html }}
-        run: |
-          {
-            echo "## Agents-Anywhere 镜像已推送"
-            echo ""
-            echo "拉取（可直接复制）："
-            echo ""
-            echo '```bash'
-            echo "docker pull ${GHCR}:${TAG}"
-            if [ "${IS_LATEST}" = "1" ]; then
-              echo "docker pull ${GHCR}:latest"
-            fi
-            echo '```'
-            echo ""
-            echo "标签："
-            echo ""
-            echo '```'
-            if [ "${IS_LATEST}" = "1" ]; then
-              echo "${GHCR}:latest          # 最新一份 release"
-            fi
-            echo "${GHCR}:${TAG}          # 对应上游 release"
-            echo "${GHCR}:${PROBE}    # 内容寻址（release 的提交前 12 位）"
-            echo '```'
-            echo ""
-            echo "平台：linux/amd64（单架构 —— Next.js 构建在 QEMU 下不可用）"
-            echo ""
-            echo "上游 release：${HTML}"
-            echo ""
-            echo "> 这是**非官方镜像**，由上游 Apache-2.0 源码构建；运行方式见仓库 \`deploy/agents-anywhere/\`。"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 无变化时的小结
         if: steps.check.outputs.need_build != '1'
@@ -305,4 +228,180 @@ jobs:
             echo ""
             echo "想强制重建：Actions → agents-anywhere → Run workflow，勾上 force；"
             echo "想重建某个历史版本：同一个入口，在 tag 里填例如 \`v2.0.0\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2. 两个架构并行构建，各自推中间标签 ─────────────────────────────────
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.need_build == '1'
+    timeout-minutes: 90
+    strategy:
+      # 一个架构失败不要掐掉另一个：两边都建完，下一次 force 重建能省一半时间。
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            # GitHub 的 arm64 托管 runner；换自建 runner 就设仓库 Variable。
+            runner: ${{ vars.AGENTS_ANYWHERE_ARM64_RUNNER || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 下载该 release 的源码
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 按 tag 取源码 tarball（codeload 不需要 token）。构建上下文必须是**仓库根**，
+          # 因为 docker/Dockerfile 里 COPY 的是 web-next/ 与 server/。
+          URL="https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/refs/tags/${TAG}"
+          curl -fsSL --retry 3 --retry-delay 5 -o upstream-src.tgz "$URL"
+
+          mkdir -p src
+          tar -xzf upstream-src.tgz -C src --strip-components=1
+          rm -f upstream-src.tgz
+
+          # 上游改动 Dockerfile 的输入路径时在这里就明确失败，别等到两层构建跑完才报错。
+          for f in "${UPSTREAM_DOCKERFILE}" web-next/package.json web-next/.yarnrc.yml server/pyproject.toml; do
+            [ -f "src/${f}" ] \
+              || { echo "::error::${TAG} 的源码里没有 ${f}，无法构建"; exit 1; }
+          done
+          echo "源码大小：$(du -sh src | cut -f1)"
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送（linux/${{ matrix.arch }}）
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          # 上游自带的 Dockerfile：多阶段（node 里 yarn build → python 里 uv sync），
+          # tini 当 PID 1，监听 8000，数据目录 /data。
+          # 显式指定 target：万一上游以后在 server 之后又加阶段，默认 target 会打错产物，
+          # 而这里会直接失败。
+          file: ./src/docker/Dockerfile
+          target: server
+          # 每个 job 只建自己那一架构，用的是原生 CPU，没有 QEMU。
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          # 每次都重新拉基础镜像：node / python 的 slim 层更新后能自动跟上，不用等下次改代码。
+          pull: true
+          labels: |
+            org.opencontainers.image.title=agents-anywhere
+            org.opencontainers.image.description=Agents-Anywhere 服务端（上游源码构建，非官方镜像）
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.url=${{ needs.prepare.outputs.html }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.tag }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.agents-anywhere.upstream.repo=${{ env.UPSTREAM_REPO }}
+            org.agents-anywhere.upstream.release=${{ needs.prepare.outputs.tag }}
+            org.agents-anywhere.upstream.commit=${{ needs.prepare.outputs.sha }}
+            org.agents-anywhere.arch=${{ matrix.arch }}
+            org.agents-anywhere.built-by=github.com/${{ github.repository }}
+          # 中间标签：按架构分开，给 merge job 合成用。也方便单独调试某一架构。
+          tags: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.probe }}-${{ matrix.arch }}
+          # 关掉证明：它会在 manifest 里塞进 attestation 条目，个别旧版 Docker 拉取时报
+          # unknown/unknown platform。要溯源就跑 `docker buildx imagetools inspect`。
+          provenance: false
+          sbom: false
+          # 复用上一次的层缓存（yarn / uv 那几层没变就不用重装）。两个架构各用一个 scope。
+          cache-from: type=gha,scope=agents-anywhere-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agents-anywhere-${{ matrix.arch }}
+
+  # ── 3. 把两个架构合成多架构 manifest ────────────────────────────────────
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 合并多架构清单
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          PROBE: ${{ needs.prepare.outputs.probe }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          SRC_AMD="${IMAGE}:${PROBE}-amd64"
+          SRC_ARM="${IMAGE}:${PROBE}-arm64"
+
+          # 先把两个源 manifest 都确认在，再动最终标签：避免只合并了一半就把 latest 改掉。
+          for t in "$SRC_AMD" "$SRC_ARM"; do
+            docker buildx imagetools inspect "$t" >/dev/null \
+              || { echo "::error::缺少 ${t}，不合并"; exit 1; }
+          done
+
+          # 所有最终标签一次推上去：它们指向同一个 index digest，不会出现「latest 换了、
+          # vX.Y.Z 没换」的中间态。
+          ARGS=()
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            ARGS+=("-t" "$t")
+          done <<< "$TAGS"
+          [ "${#ARGS[@]}" -gt 0 ] || { echo "::error::没有要合成的标签"; exit 1; }
+
+          printf '合成到：%s\n' "${ARGS[*]}"
+          docker buildx imagetools create "${ARGS[@]}" "$SRC_AMD" "$SRC_ARM"
+
+          echo "--- 结果 ---"
+          docker buildx imagetools inspect "${IMAGE}:${PROBE}"
+
+      - name: 输出结果
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PROBE: ${{ needs.prepare.outputs.probe }}
+          IS_LATEST: ${{ needs.prepare.outputs.is_latest }}
+          HTML: ${{ needs.prepare.outputs.html }}
+          PLATFORMS: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.probe }}
+        run: |
+          {
+            echo "## Agents-Anywhere 镜像已推送"
+            echo ""
+            echo "拉取（可直接复制）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${TAG}"
+            if [ "${IS_LATEST}" = "1" ]; then
+              echo "docker pull ${IMAGE}:latest"
+            fi
+            echo '```'
+            echo ""
+            echo "标签："
+            echo ""
+            echo '```'
+            if [ "${IS_LATEST}" = "1" ]; then
+              echo "${IMAGE}:latest          # 最新一份 release"
+            fi
+            echo "${IMAGE}:${TAG}          # 对应上游 release"
+            echo "${IMAGE}:${PROBE}    # 内容寻址（release 的提交前 12 位）"
+            echo '```'
+            echo ""
+            echo "平台：linux/amd64 + linux/arm64（各自原生构建，无 QEMU；\`docker pull\` 自动选架构）"
+            echo ""
+            echo "按架构的中间标签（调试用，一般不直接用）："
+            echo ""
+            echo '```'
+            echo "${IMAGE}:${PROBE}-amd64"
+            echo "${IMAGE}:${PROBE}-arm64"
+            echo '```'
+            echo ""
+            echo "上游 release：${HTML}"
+            echo ""
+            echo "> 这是**非官方镜像**，由上游 Apache-2.0 源码构建；运行方式见仓库 \`deploy/agents-anywhere/\`。"
           } >> "$GITHUB_STEP_SUMMARY"
