@@ -1,0 +1,4 @@
+# 仓库里有 .github/workflows/*.yml，其中的 run: | 是 bash 脚本。
+# Windows 上 core.autocrlf=true 时提交会把换行转成 CRLF，runner 上 bash 直接报
+# `$'\r': command not found`。这里统一钉成 LF，避免这类「本机没问题、CI 炸」的坑。
+* text=auto eol=lf

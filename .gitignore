@@ -1,0 +1,7 @@
+# 部署用的真实凭据，只留 .env.example
+.env
+deploy/**/.env
+
+# 本地手动构建时的临时目录
+/src/
+upstream-src.tgz
